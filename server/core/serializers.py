@@ -1,0 +1,161 @@
+from rest_framework import serializers
+from .models import School, MarketingRequest, RequestAttachment, CommunicationLog, Document, User, Announcement, AuditLog, VisitSchedule
+
+
+class SchoolSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = School
+        fields = '__all__'
+
+
+class RequestAttachmentSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = RequestAttachment
+        fields = ['id', 'file', 'original_name', 'uploaded_at']
+        read_only_fields = ['uploaded_at']
+
+
+class MarketingRequestSerializer(serializers.ModelSerializer):
+    requester_name = serializers.SerializerMethodField()
+    attachments = RequestAttachmentSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = MarketingRequest
+        fields = [
+            'id', 'requester', 'requester_name', 'title', 'type', 'request_type',
+            'description', 'preferred_date', 'status', 'notes', 'reviewed_by',
+            'is_draft',
+            # Production fields
+            'requesting_unit', 'expected_medium', 'event_description', 'event_objectives',
+            'audience', 'event_date', 'event_venue', 'materials_endorsed',
+            # Information Dissemination fields
+            'platform', 'writers', 'keywords',
+            # Outcome fields
+            'accomplishment_date', 'involved_members',
+            'created_at', 'updated_at', 'attachments',
+        ]
+        read_only_fields = ['created_at', 'updated_at']
+
+    def get_requester_name(self, obj):
+        full_name = f"{obj.requester.first_name} {obj.requester.last_name}".strip()
+        return full_name if full_name else obj.requester.username
+
+
+class CommunicationLogSerializer(serializers.ModelSerializer):
+    file_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = CommunicationLog
+        fields = [
+            'id', 'sender_name', 'recipient_name', 'message', 'status',
+            'related_request', 'file', 'file_name', 'file_url',
+            'client_temp_id', 'created_at',
+        ]
+        read_only_fields = ['created_at', 'file_url']
+        extra_kwargs = {
+            'file': {'write_only': True, 'required': False},
+        }
+
+    def get_file_url(self, obj):
+        if not obj.file:
+            return None
+        request = self.context.get('request')
+        return request.build_absolute_uri(obj.file.url) if request else obj.file.url
+
+
+class DocumentSerializer(serializers.ModelSerializer):
+    created_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Document
+        fields = [
+            'id', 'title', 'type', 'content', 'status',
+            'created_by', 'created_by_name', 'created_at', 'updated_at',
+        ]
+        read_only_fields = ['created_at', 'updated_at']
+
+    def get_created_by_name(self, obj):
+        if not obj.created_by:
+            return None
+        full_name = f"{obj.created_by.first_name} {obj.created_by.last_name}".strip()
+        return full_name if full_name else obj.created_by.username
+
+
+class UserSerializer(serializers.ModelSerializer):
+    password = serializers.CharField(write_only=True, required=False)
+    avatar_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = User
+        fields = [
+            'id', 'username', 'first_name', 'last_name', 'email',
+            'role', 'is_active', 'is_archived', 'last_login', 'date_joined', 'password',
+            'must_change_password', 'temp_password_expires_at', 'email_delivered',
+            'avatar_url',
+        ]
+        extra_kwargs = {
+            'password': {'write_only': True},
+            'must_change_password': {'read_only': True},
+            'temp_password_expires_at': {'read_only': True},
+            'email_delivered': {'read_only': True},
+        }
+
+    def get_avatar_url(self, obj):
+        if not obj.avatar:
+            return None
+        request = self.context.get('request') if hasattr(self, 'context') else None
+        url = obj.avatar.url
+        return request.build_absolute_uri(url) if request else url
+
+
+class AnnouncementSerializer(serializers.ModelSerializer):
+    created_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Announcement
+        fields = ['id', 'title', 'message', 'target', 'created_by', 'created_by_name', 'created_at', 'is_active']
+        read_only_fields = ['created_at', 'created_by']
+
+    def get_created_by_name(self, obj):
+        if not obj.created_by:
+            return None
+        full_name = f"{obj.created_by.first_name} {obj.created_by.last_name}".strip()
+        return full_name if full_name else obj.created_by.username
+
+
+class AuditLogSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = AuditLog
+        fields = ['id', 'timestamp', 'user', 'user_name', 'email', 'action', 'resource', 'ip_address', 'details', 'metadata']
+
+
+class VisitScheduleSerializer(serializers.ModelSerializer):
+    school_name     = serializers.CharField(source='school.school_name', read_only=True)
+    school_address  = serializers.CharField(source='school.address', read_only=True)
+    school_strands  = serializers.CharField(source='school.offered_strands', read_only=True)
+    personnel_names = serializers.SerializerMethodField()
+    created_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model  = VisitSchedule
+        fields = [
+            'id', 'school', 'school_name', 'school_address', 'school_strands',
+            'date', 'start_time', 'end_time', 'purpose',
+            'assigned_personnel', 'personnel_names',
+            'notes', 'status', 'created_by', 'created_by_name',
+            'created_at', 'updated_at',
+        ]
+        read_only_fields = ['created_at', 'updated_at', 'created_by']
+
+    def get_personnel_names(self, obj):
+        names = []
+        for u in obj.assigned_personnel.all():
+            full = f"{u.first_name} {u.last_name}".strip()
+            names.append(full or u.username)
+        return names
+
+    def get_created_by_name(self, obj):
+        if not obj.created_by:
+            return None
+        full = f"{obj.created_by.first_name} {obj.created_by.last_name}".strip()
+        return full or obj.created_by.username

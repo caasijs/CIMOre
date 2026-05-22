@@ -1,0 +1,2054 @@
+import json
+import logging
+import os
+import zipfile
+from datetime import date, datetime, timedelta
+from io import BytesIO
+from uuid import uuid4
+
+from django.conf import settings as django_settings
+from django.contrib.auth import authenticate
+from django.core.exceptions import ValidationError
+from django.core.files.base import ContentFile
+from django.core.files.storage import default_storage
+from django.db import transaction
+from django.db.models import Count, Q
+from django.http import HttpResponse
+from django.utils import timezone
+from PIL import Image, ImageOps
+from rest_framework.decorators import api_view, permission_classes
+from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.response import Response
+from rest_framework import status
+
+from .email_utils import (
+    generate_temp_password, send_welcome_email,
+    send_request_confirmation_email, send_notification_email,
+    send_password_reset_email,
+    validate_email_domain, DOMAIN_ERROR,
+)
+from .models import (
+    School, MarketingRequest, RequestAttachment, CommunicationLog,
+    Document, User, Notification, NotificationPreference, PasswordResetToken,
+    Announcement, SecureToken, AuditLog, VisitSchedule,
+)
+from .serializers import (
+    SchoolSerializer, MarketingRequestSerializer, RequestAttachmentSerializer,
+    CommunicationLogSerializer, DocumentSerializer, UserSerializer,
+    AnnouncementSerializer, AuditLogSerializer, VisitScheduleSerializer,
+)
+from .permissions import IsAdmin, IsAdminOrStaff
+
+logger = logging.getLogger(__name__)
+
+
+def get_client_ip(request):
+    x_forwarded = request.META.get('HTTP_X_FORWARDED_FOR')
+    if x_forwarded:
+        return x_forwarded.split(',')[0].strip()
+    return request.META.get('REMOTE_ADDR', '')
+
+
+def create_audit_log(*, user=None, action, resource='', details='', ip_address='', metadata=None):
+    """Record an audit event. Never raises — a failure here must not abort the main request."""
+    try:
+        user_name = ''
+        email = ''
+        if user:
+            user_name = f"{user.first_name} {user.last_name}".strip() or user.username
+            email = user.email or ''
+        AuditLog.objects.create(
+            user=user,
+            user_name=user_name,
+            email=email,
+            action=action,
+            resource=resource,
+            ip_address=ip_address,
+            details=details,
+            metadata=metadata,
+        )
+    except Exception:
+        logger.exception('Failed to write audit log: action=%s', action)
+
+
+MAX_AVATAR_FILE_SIZE = 5 * 1024 * 1024
+AVATAR_MAX_DIMENSION = 512
+ALLOWED_AVATAR_CONTENT_TYPES = {
+    'image/jpeg': 'jpg',
+    'image/png': 'png',
+    'image/webp': 'webp',
+}
+
+
+def optimize_avatar_image(uploaded_file):
+    if uploaded_file.size > MAX_AVATAR_FILE_SIZE:
+        raise ValidationError('Avatar must be 5MB or smaller.')
+
+    content_type = uploaded_file.content_type
+    ext = ALLOWED_AVATAR_CONTENT_TYPES.get(content_type)
+    if not ext:
+        raise ValidationError('Invalid image type. Please upload JPEG, PNG, or WebP.')
+
+    try:
+        image = Image.open(uploaded_file)
+        image.verify()
+    except Exception:
+        raise ValidationError('Uploaded file must be a valid image.')
+
+    uploaded_file.seek(0)
+    image = Image.open(uploaded_file)
+    image = ImageOps.exif_transpose(image)
+    if image.mode in ('P', 'RGBA', 'LA'):
+        image = image.convert('RGBA')
+    else:
+        image = image.convert('RGB')
+    image.thumbnail((AVATAR_MAX_DIMENSION, AVATAR_MAX_DIMENSION), Image.LANCZOS)
+
+    output = BytesIO()
+    if ext == 'jpg':
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        image.save(output, format='JPEG', quality=75, optimize=True)
+    elif ext == 'webp':
+        image.save(output, format='WEBP', quality=80, optimize=True, method=6)
+    else:
+        image.save(output, format='PNG', optimize=True)
+
+    uploaded_file.seek(0)
+    output.seek(0)
+    return ContentFile(output.read(), name=f"avatar-{uuid4().hex}.{ext}")
+
+
+def replace_user_avatar(user, uploaded_file):
+    new_avatar = optimize_avatar_image(uploaded_file)
+    old_avatar_name = user.avatar.name if user.avatar else None
+    user.avatar.save(new_avatar.name, new_avatar, save=False)
+    return old_avatar_name
+
+
+# ---------------------------------------------------------------------------
+# AUTH
+# ---------------------------------------------------------------------------
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def login_api(request):
+    username = request.data.get('username')
+    password = request.data.get('password')
+
+    user = authenticate(username=username, password=password)
+    if not user:
+        return Response(
+            {"error": "Invalid credentials. Please try again."},
+            status=status.HTTP_401_UNAUTHORIZED,
+        )
+
+    # Domain restriction — only @slc-sflu.edu.ph accounts may log in
+    if '@' in str(username) and not str(username).lower().endswith('@slc-sflu.edu.ph'):
+        return Response({"error": DOMAIN_ERROR}, status=status.HTTP_403_FORBIDDEN)
+
+    if not user.is_active:
+        return Response(
+            {"error": "This account has been deactivated."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
+    # Reject login if the temporary password has passed its 24-hour window
+    if user.must_change_password and user.temp_password_expires_at:
+        if timezone.now() > user.temp_password_expires_at:
+            return Response(
+                {"error": "Your temporary password has expired. Please contact an administrator to reset your account."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+    # Record first-login: clear the temp-password requirement before responding
+    first_login = user.must_change_password
+    update_fields = ['last_login']
+    user.last_login = timezone.now()
+    if first_login:
+        user.must_change_password = False
+        user.temp_password_expires_at = None
+        update_fields += ['must_change_password', 'temp_password_expires_at']
+    user.save(update_fields=update_fields)
+
+    raw_token = SecureToken.create_for_user(user)
+    user_data = UserSerializer(user, context={'request': request}).data
+
+    create_audit_log(
+        user=user,
+        action='USER_LOGIN',
+        resource='Authentication',
+        details=f"User '{user.username}' logged in.",
+        ip_address=get_client_ip(request),
+    )
+
+    return Response({
+        "message": "Login successful",
+        "token": raw_token,
+        "role": user.role,
+        "fullName": f"{user.first_name} {user.last_name}".strip() or user.username,
+        "username": user.username,
+        "user_id": user.id,
+        "last_login": user.last_login,
+        "must_change_password": first_login,
+        "avatar_url": user_data.get('avatar_url'),
+    }, status=status.HTTP_200_OK)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def logout_api(request):
+    create_audit_log(
+        user=request.user,
+        action='USER_LOGOUT',
+        resource='Authentication',
+        details=f"User '{request.user.username}' logged out.",
+        ip_address=get_client_ip(request),
+    )
+    SecureToken.objects.filter(user=request.user).delete()
+    return Response({"message": "Logged out successfully."})
+
+
+# ---------------------------------------------------------------------------
+# SELF-REGISTRATION  (Public)
+# ---------------------------------------------------------------------------
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def register_api(request):
+    first_name = request.data.get('first_name', '').strip()
+    last_name  = request.data.get('last_name', '').strip()
+    email      = request.data.get('email', '').strip().lower()
+    department = request.data.get('department', '').strip()
+    id_number  = request.data.get('id_number', '').strip()
+
+    if not first_name or not last_name:
+        return Response({"error": "First name and last name are required."}, status=status.HTTP_400_BAD_REQUEST)
+    if not email:
+        return Response({"error": "Email is required."}, status=status.HTTP_400_BAD_REQUEST)
+    if not email.endswith('@slc-sflu.edu.ph'):
+        return Response({"error": DOMAIN_ERROR}, status=status.HTTP_400_BAD_REQUEST)
+    if User.objects.filter(username=email).exists():
+        return Response({"error": "An account with this email already exists."}, status=status.HTTP_400_BAD_REQUEST)
+
+    temp_password = generate_temp_password(
+        first_name=first_name, last_name=last_name, username=email, email=email,
+    )
+    user = User(
+        username=email, email=email,
+        first_name=first_name, last_name=last_name,
+        role='Collaborator', department=department, id_number=id_number,
+        must_change_password=True,
+        temp_password_expires_at=timezone.now() + timedelta(hours=24),
+    )
+    avatar_file = request.FILES.get('avatar')
+    if avatar_file:
+        try:
+            optimize_avatar_image(avatar_file)
+        except ValidationError as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+    user.set_password(temp_password)
+    user.save()
+
+    if avatar_file:
+        try:
+            old_avatar = replace_user_avatar(user, avatar_file)
+            user.save(update_fields=['avatar'])
+            if old_avatar and default_storage.exists(old_avatar):
+                default_storage.delete(old_avatar)
+        except Exception:
+            logger.exception('Error saving registration avatar for user_id=%s', user.id)
+
+    logger.info("Self-registration: user_id=%s email=%s at=%s", user.id, email, timezone.now().isoformat())
+
+    full_name = f"{first_name} {last_name}"
+    delivered = send_welcome_email(user_email=email, full_name=full_name, username=email, temp_password=temp_password)
+    if not delivered:
+        logger.error("Welcome email not delivered for registered user_id=%s", user.id)
+    user.email_delivered = delivered
+    user.save(update_fields=['email_delivered'])
+
+    return Response({
+        "message": "Account created successfully. Check your email for your temporary login password.",
+        "email_delivered": delivered,
+    }, status=status.HTTP_201_CREATED)
+
+
+# ---------------------------------------------------------------------------
+# USER PROFILE  (own account — any authenticated user)
+# ---------------------------------------------------------------------------
+
+@api_view(['GET', 'PUT'])
+@permission_classes([IsAuthenticated])
+def profile_api(request):
+    user = request.user
+    if request.method == 'GET':
+        return Response(UserSerializer(user, context={'request': request}).data)
+
+    new_password     = request.data.get('password', '').strip()
+    current_password = request.data.get('current_password', '').strip()
+    avatar_file      = request.FILES.get('avatar')
+
+    if new_password:
+        if not current_password or not user.check_password(current_password):
+            return Response(
+                {"error": "Current password is incorrect."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if len(new_password) < 8:
+            return Response({"error": "Password must be at least 8 characters."}, status=status.HTTP_400_BAD_REQUEST)
+        user.set_password(new_password)
+
+    old_avatar_name = None
+    if avatar_file:
+        try:
+            old_avatar_name = replace_user_avatar(user, avatar_file)
+        except ValidationError as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception:
+            logger.exception('Avatar processing failed for user_id=%s', user.id)
+            return Response(
+                {"error": "Failed to process the uploaded avatar image."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+    update_fields = []
+    if new_password:
+        update_fields.append('password')
+    if avatar_file:
+        update_fields.append('avatar')
+
+    try:
+        if update_fields:
+            user.save(update_fields=update_fields)
+    except Exception:
+        if avatar_file and user.avatar and default_storage.exists(user.avatar.name):
+            default_storage.delete(user.avatar.name)
+        logger.exception('Failed to save updated profile for user_id=%s', user.id)
+        return Response(
+            {"error": "Unable to update profile at this time."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+    if old_avatar_name and old_avatar_name != user.avatar.name and default_storage.exists(old_avatar_name):
+        default_storage.delete(old_avatar_name)
+
+    response_data = UserSerializer(user, context={'request': request}).data
+    if new_password:
+        new_raw = SecureToken.create_for_user(user)
+        response_data['token'] = new_raw
+        logger.info("Password changed for user_id=%s", user.id)
+        create_audit_log(
+            user=user,
+            action='PASSWORD_CHANGED',
+            resource='Profile',
+            details=f"User '{user.username}' changed their password.",
+            ip_address=get_client_ip(request),
+        )
+
+    return Response(response_data)
+
+
+@api_view(['PUT'])
+@permission_classes([IsAuthenticated])
+def force_change_password_api(request):
+    """First-login forced password change — no current_password required."""
+    new_password = (request.data.get('password') or '').strip()
+    if not new_password:
+        return Response({'error': 'Password is required.'}, status=status.HTTP_400_BAD_REQUEST)
+    if len(new_password) < 8:
+        return Response({'error': 'Password must be at least 8 characters.'}, status=status.HTTP_400_BAD_REQUEST)
+    user = request.user
+    user.set_password(new_password)
+    user.must_change_password = False
+    user.save(update_fields=['password', 'must_change_password'])
+    new_raw = SecureToken.create_for_user(user)
+    logger.info('Forced password change completed for user_id=%s', user.id)
+    create_audit_log(
+        user=user,
+        action='PASSWORD_CHANGED',
+        resource='Authentication',
+        details=f"User '{user.username}' completed forced first-login password change.",
+        ip_address=get_client_ip(request),
+    )
+    return Response({'message': 'Password updated successfully.', 'token': new_raw})
+
+
+# ---------------------------------------------------------------------------
+# USER MANAGEMENT  (Admin only)
+# ---------------------------------------------------------------------------
+
+@api_view(['GET', 'POST'])
+@permission_classes([IsAdmin])
+def users_api(request):
+    if request.method == 'GET':
+        show_archived = request.query_params.get('archived', 'false').lower() == 'true'
+        users = User.objects.filter(is_archived=show_archived).order_by('last_name', 'first_name')
+        serializer = UserSerializer(users, many=True, context={'request': request})
+        return Response(serializer.data)
+
+    serializer = UserSerializer(data=request.data)
+    if serializer.is_valid():
+        user = User(**{
+            k: v for k, v in serializer.validated_data.items() if k != 'password'
+        })
+
+        # Auto-generate a secure temporary password — never use a caller-supplied one
+        temp_password = generate_temp_password(
+            first_name=user.first_name,
+            last_name=user.last_name,
+            username=user.username,
+            email=user.email,
+        )
+        user.set_password(temp_password)
+        user.must_change_password = True
+        user.temp_password_expires_at = timezone.now() + timedelta(hours=24)
+        user.save()
+
+        logger.info(
+            "Account created: user_id=%s username=%s at=%s (admin=%s)",
+            user.id, user.username, timezone.now().isoformat(), request.user.username,
+        )
+
+        # Send welcome email with retry; flag the account if delivery fails
+        full_name = f"{user.first_name} {user.last_name}".strip() or user.username
+        delivered = send_welcome_email(
+            user_email=user.email,
+            full_name=full_name,
+            username=user.username,
+            temp_password=temp_password,
+        )
+        if not delivered:
+            logger.error(
+                "Welcome email not delivered for user_id=%s — manual intervention required",
+                user.id,
+            )
+        user.email_delivered = delivered
+        user.save(update_fields=['email_delivered'])
+
+        create_audit_log(
+            user=request.user,
+            action='USER_CREATED',
+            resource='User Management',
+            details=f"Admin created new user '{user.username}' with role '{user.role}'.",
+            ip_address=get_client_ip(request),
+        )
+
+        # Notify all admins that a new user was created
+        _notify_role(
+            ['Admin'],
+            'New User Account Created',
+            f"{full_name} ({user.role}) has been added to the system by {request.user.get_full_name() or request.user.username}.",
+            notif_type='user',
+            link='/users',
+            exclude_user=request.user,
+        )
+
+        return Response(UserSerializer(user).data, status=status.HTTP_201_CREATED)
+    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+@api_view(['GET', 'PUT', 'DELETE'])
+@permission_classes([IsAdmin])
+def user_detail_api(request, user_id):
+    try:
+        user = User.objects.get(id=user_id)
+    except User.DoesNotExist:
+        return Response({"error": "User not found"}, status=status.HTTP_404_NOT_FOUND)
+
+    if request.method == 'GET':
+        return Response(UserSerializer(user, context={'request': request}).data)
+
+    if request.method == 'PUT':
+        serializer = UserSerializer(user, data=request.data, partial=True)
+        if serializer.is_valid():
+            if 'password' in request.data and request.data['password']:
+                user.set_password(request.data['password'])
+                user.save()
+            serializer.save()
+            audit_action = 'USER_ARCHIVED' if serializer.validated_data.get('is_archived') else 'USER_UPDATED'
+            create_audit_log(
+                user=request.user,
+                action=audit_action,
+                resource='User Management',
+                details=f"User '{user.username}' (id={user.id}) was {audit_action.replace('_', ' ').lower()} by admin.",
+                ip_address=get_client_ip(request),
+            )
+            if 'is_archived' in serializer.validated_data:
+                if serializer.validated_data['is_archived']:
+                    user.is_active = False
+                else:
+                    user.is_active = True
+                user.save(update_fields=['is_active'])
+            return Response(serializer.data)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    # DELETE — archive user instead of hard delete and deactivate their account
+    user.is_archived = True
+    user.is_active = False
+    user.save(update_fields=['is_archived', 'is_active'])
+    create_audit_log(
+        user=request.user,
+        action='USER_ARCHIVED',
+        resource='User Management',
+        details=f"User '{user.username}' (id={user.id}) was archived by admin.",
+        ip_address=get_client_ip(request),
+    )
+    return Response({"message": "User archived."}, status=status.HTTP_200_OK)
+
+
+# ---------------------------------------------------------------------------
+# MARKETING REQUEST MANAGEMENT
+#   - Collaborator: create own, view own, edit own (Pending only), cancel own
+#   - Staff/Admin: view all, approve/reject/edit any
+# ---------------------------------------------------------------------------
+
+@api_view(['GET', 'POST'])
+@permission_classes([IsAuthenticated])
+def marketing_requests_api(request):
+    user = request.user
+
+    if request.method == 'GET':
+        if user.role == 'Collaborator':
+            qs = MarketingRequest.objects.filter(requester=user).order_by('-created_at')
+        else:
+            qs = MarketingRequest.objects.select_related('requester').order_by('-created_at')
+        return Response(MarketingRequestSerializer(qs, many=True).data)
+
+    # POST — any authenticated user can submit a request
+    data = request.data.copy()
+    data['requester'] = user.id
+    serializer = MarketingRequestSerializer(data=data)
+    if serializer.is_valid():
+        instance = serializer.save()
+        # Send confirmation email to the requester
+        full_name = f"{user.first_name} {user.last_name}".strip() or user.username
+        pref = str(instance.preferred_date) if instance.preferred_date else 'Not specified'
+        send_request_confirmation_email(
+            user_email=user.email,
+            full_name=full_name,
+            title=instance.title or instance.type,
+            request_id=instance.id,
+            request_type=instance.type,
+            preferred_date=pref,
+        )
+        create_audit_log(
+            user=user,
+            action='REQUEST_CREATED',
+            resource='Marketing Requests',
+            details=f"Request '{instance.title or instance.type}' (id={instance.id}) submitted.",
+            ip_address=get_client_ip(request),
+        )
+        # Notify staff and admins about the new request
+        req_label = instance.title or instance.type
+        _notify_role(
+            ['Admin', 'Staff'],
+            'New Marketing Request Submitted',
+            f"{full_name} submitted a new request: \"{req_label}\" (#{instance.id}).",
+            notif_type='request',
+            link=f'/request-detail/{instance.id}',
+            exclude_user=user,
+        )
+        return Response(MarketingRequestSerializer(instance).data, status=status.HTTP_201_CREATED)
+    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+@api_view(['GET', 'PUT', 'DELETE'])
+@permission_classes([IsAuthenticated])
+def marketing_request_detail_api(request, request_id):
+    try:
+        mr = MarketingRequest.objects.select_related('requester').get(id=request_id)
+    except MarketingRequest.DoesNotExist:
+        return Response({"error": "Request not found"}, status=status.HTTP_404_NOT_FOUND)
+
+    user = request.user
+    is_owner = mr.requester_id == user.id
+    is_staff_or_admin = user.role in ('Admin', 'Staff')
+
+    if not (is_owner or is_staff_or_admin):
+        return Response({"error": "Forbidden."}, status=status.HTTP_403_FORBIDDEN)
+
+    if request.method == 'GET':
+        return Response(MarketingRequestSerializer(mr).data)
+
+    if request.method == 'PUT':
+        data = request.data.copy()
+
+        if is_staff_or_admin:
+            # Staff/Admin can update status, notes, reviewed_by, and outcome fields
+            _ALLOWED = ('status', 'notes', 'type', 'description', 'accomplishment_date', 'involved_members')
+            allowed = {k: data[k] for k in _ALLOWED if k in data}
+            if 'status' in allowed:
+                allowed['reviewed_by'] = user.id
+        else:
+            # Collaborator can only edit their own Pending request (cancel or update details)
+            if mr.status != 'Pending':
+                return Response(
+                    {"error": "Only pending requests can be edited or cancelled."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            allowed = {k: data[k] for k in ('type', 'description', 'status') if k in data}
+            # Collaborator may only set status to Cancelled
+            if 'status' in allowed and allowed['status'] not in ('Cancelled',):
+                return Response(
+                    {"error": "Collaborators may only cancel their own requests."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
+        serializer = MarketingRequestSerializer(mr, data=allowed, partial=True)
+        if serializer.is_valid():
+            prev_status = mr.status
+            updated = serializer.save()
+            new_status = updated.status
+            status_changed = new_status != prev_status
+            create_audit_log(
+                user=user,
+                action='REQUEST_UPDATED',
+                resource='Marketing Requests',
+                details=(
+                    f"Request '{updated.title or updated.type}' (id={updated.id}) status changed: {prev_status} → {new_status}."
+                    if status_changed else
+                    f"Request '{updated.title or updated.type}' (id={updated.id}) updated."
+                ),
+                ip_address=get_client_ip(request),
+                metadata={'before': {'status': prev_status}, 'after': {'status': new_status}} if status_changed else None,
+            )
+            # Notify the requester if status changed to a terminal state
+            if is_staff_or_admin and status_changed and new_status in ('Approved', 'Rejected', 'Cancelled'):
+                req_label = updated.title or updated.type
+                reviewer_name = request.user.get_full_name() or request.user.username
+                _notify(
+                    updated.requester,
+                    f'Your Request Has Been {new_status}',
+                    f"Your request \"{req_label}\" (#{updated.id}) was {new_status.lower()} by {reviewer_name}.",
+                    notif_type='request',
+                    link=f'/request-detail/{updated.id}',
+                )
+            return Response(serializer.data)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    # DELETE — Staff/Admin only hard-delete; collaborator cannot delete
+    if not is_staff_or_admin:
+        return Response({"error": "Forbidden."}, status=status.HTTP_403_FORBIDDEN)
+    req_label, req_id = mr.title or mr.type, mr.id
+    mr.delete()
+    create_audit_log(
+        user=user,
+        action='REQUEST_DELETED',
+        resource='Marketing Requests',
+        details=f"Request '{req_label}' (id={req_id}) was deleted.",
+        ip_address=get_client_ip(request),
+    )
+    return Response({"message": "Request deleted."}, status=status.HTTP_204_NO_CONTENT)
+
+
+# ---------------------------------------------------------------------------
+# REQUEST ATTACHMENTS
+# ---------------------------------------------------------------------------
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def request_attachments_api(request, request_id):
+    try:
+        mr = MarketingRequest.objects.get(id=request_id)
+    except MarketingRequest.DoesNotExist:
+        return Response({"error": "Request not found."}, status=status.HTTP_404_NOT_FOUND)
+
+    if mr.requester_id != request.user.id and request.user.role not in ('Admin', 'Staff'):
+        return Response({"error": "Forbidden."}, status=status.HTTP_403_FORBIDDEN)
+
+    file = request.FILES.get('file')
+    if not file:
+        return Response({"error": "No file provided."}, status=status.HTTP_400_BAD_REQUEST)
+
+    MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024  # 10 MB
+    if file.size > MAX_ATTACHMENT_BYTES:
+        return Response({"error": "File exceeds the 10 MB limit."}, status=status.HTTP_400_BAD_REQUEST)
+
+    attachment = RequestAttachment.objects.create(
+        request=mr,
+        file=file,
+        original_name=file.name,
+    )
+    return Response(RequestAttachmentSerializer(attachment).data, status=status.HTTP_201_CREATED)
+
+
+# ---------------------------------------------------------------------------
+# COMMUNICATION LOGS
+#   - All authenticated users can view and send
+#   - Staff/Admin can update status
+# ---------------------------------------------------------------------------
+
+@api_view(['GET', 'POST'])
+@permission_classes([IsAuthenticated])
+def communication_logs_api(request):
+    user = request.user
+
+    if request.method == 'GET':
+        if user.role == 'Collaborator':
+            qs = CommunicationLog.objects.filter(related_request__requester=user)
+        else:
+            qs = CommunicationLog.objects.select_related('related_request')
+        rid = request.query_params.get('request_id')
+        if rid:
+            try:
+                qs = qs.filter(related_request_id=int(rid))
+            except (ValueError, TypeError):
+                pass
+        return Response(CommunicationLogSerializer(
+            qs.order_by('created_at'), many=True, context={'request': request}
+        ).data)
+
+    # Deduplication: if this client_temp_id was already saved, return the existing record
+    client_temp_id = request.data.get('client_temp_id', '').strip()
+    if client_temp_id:
+        existing = CommunicationLog.objects.filter(client_temp_id=client_temp_id).first()
+        if existing:
+            return Response(
+                CommunicationLogSerializer(existing, context={'request': request}).data,
+                status=status.HTTP_200_OK,
+            )
+
+    # Validate uploaded file before touching the serializer so we return 400, not 500
+    uploaded_file = request.FILES.get('file')
+    if uploaded_file:
+        MAX_CHAT_FILE_BYTES = 10 * 1024 * 1024
+        ALLOWED_CHAT_TYPES = {
+            'image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp',
+            'application/pdf',
+            'application/msword',
+            'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            'video/mp4', 'video/quicktime',
+        }
+        if uploaded_file.size == 0:
+            return Response(
+                {'error': 'The uploaded file is empty. Please select a valid file.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if uploaded_file.size > MAX_CHAT_FILE_BYTES:
+            return Response(
+                {'error': 'File exceeds the 10 MB limit.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        ct = getattr(uploaded_file, 'content_type', '') or ''
+        if ct and ct not in ALLOWED_CHAT_TYPES:
+            return Response(
+                {'error': f'File type "{ct}" is not supported. Upload images, PDF, Word, or video files.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+    serializer = CommunicationLogSerializer(data=request.data, context={'request': request})
+    if serializer.is_valid():
+        try:
+            instance = serializer.save()
+        except Exception:
+            logger.exception('Failed to save communication log for user_id=%s', user.id)
+            return Response(
+                {'error': 'Failed to save message. Please try again.'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+        try:
+            related_req = instance.related_request
+            if related_req:
+                link = f'/request-detail/{related_req.id}?chat=true'
+                sender = user.get_full_name() or user.username
+                title_str = related_req.title or f'Request #{related_req.id}'
+                if instance.message:
+                    preview = (instance.message[:80] + '…') if len(instance.message) > 80 else instance.message
+                    body = f'Re: "{title_str}" — {preview}'
+                elif instance.file_name:
+                    body = f'Re: "{title_str}" — [attachment: {instance.file_name}]'
+                else:
+                    body = f'Re: "{title_str}"'
+                if user == related_req.requester:
+                    _notify_role(
+                        ['Admin', 'Staff'],
+                        f'New message from {sender}',
+                        body,
+                        notif_type='message',
+                        link=link,
+                        exclude_user=user,
+                    )
+                else:
+                    _notify(
+                        related_req.requester,
+                        f'New message from {sender}',
+                        body,
+                        notif_type='message',
+                        link=link,
+                    )
+        except Exception:
+            logger.exception('Post-save notification failed for communication log id=%s', instance.id)
+        return Response(
+            CommunicationLogSerializer(instance, context={'request': request}).data,
+            status=status.HTTP_201_CREATED,
+        )
+    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+@api_view(['GET', 'PUT'])
+@permission_classes([IsAuthenticated])
+def communication_log_detail_api(request, log_id):
+    try:
+        log = CommunicationLog.objects.get(id=log_id)
+    except CommunicationLog.DoesNotExist:
+        return Response({"error": "Communication log not found"}, status=status.HTTP_404_NOT_FOUND)
+
+    if request.method == 'GET':
+        return Response(CommunicationLogSerializer(log).data)
+
+    # Only Staff/Admin can update log status
+    if request.user.role not in ('Admin', 'Staff'):
+        return Response({"error": "Forbidden."}, status=status.HTTP_403_FORBIDDEN)
+
+    serializer = CommunicationLogSerializer(log, data=request.data, partial=True)
+    if serializer.is_valid():
+        serializer.save()
+        return Response(serializer.data)
+    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+# ---------------------------------------------------------------------------
+# TRAILBLAZING / SCHOOL MANAGEMENT  (Staff and Admin)
+# ---------------------------------------------------------------------------
+
+@api_view(['GET', 'POST'])
+@permission_classes([IsAdminOrStaff])
+def schools_api(request):
+    if request.method == 'GET':
+        show_archived = request.query_params.get('archived', 'false').lower() == 'true'
+        qs = School.objects.filter(is_archived=show_archived).order_by('school_name')
+        return Response(SchoolSerializer(qs, many=True).data)
+
+    serializer = SchoolSerializer(data=request.data)
+    if serializer.is_valid():
+        serializer.save()
+        create_audit_log(
+            user=request.user,
+            action='SCHOOL_CREATED',
+            resource='School Intelligence',
+            details=f"School '{serializer.data['school_name']}' (id={serializer.data['id']}) added.",
+            ip_address=get_client_ip(request),
+        )
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+@api_view(['GET', 'PUT', 'DELETE'])
+@permission_classes([IsAdminOrStaff])
+def school_detail_api(request, school_id):
+    try:
+        school = School.objects.get(id=school_id)
+    except School.DoesNotExist:
+        return Response({"error": "School not found"}, status=status.HTTP_404_NOT_FOUND)
+
+    if request.method == 'GET':
+        return Response(SchoolSerializer(school).data)
+
+    if request.method == 'PUT':
+        serializer = SchoolSerializer(school, data=request.data, partial=True)
+        if serializer.is_valid():
+            serializer.save()
+            create_audit_log(
+                user=request.user,
+                action='SCHOOL_UPDATED',
+                resource='School Intelligence',
+                details=f"School '{school.school_name}' (id={school.id}) updated.",
+                ip_address=get_client_ip(request),
+            )
+            return Response(serializer.data)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    # DELETE — archive instead of hard delete
+    school.is_archived = True
+    school.save(update_fields=['is_archived'])
+    create_audit_log(
+        user=request.user,
+        action='SCHOOL_ARCHIVED',
+        resource='School Intelligence',
+        details=f"School '{school.school_name}' (id={school.id}) archived.",
+        ip_address=get_client_ip(request),
+    )
+    return Response({"message": "School archived."}, status=status.HTTP_200_OK)
+
+
+# ---------------------------------------------------------------------------
+# VISIT SCHEDULES  (Staff and Admin)
+# ---------------------------------------------------------------------------
+
+@api_view(['GET', 'POST'])
+@permission_classes([IsAdminOrStaff])
+def trailblazing_schedules_api(request):
+    if request.method == 'GET':
+        qs = (
+            VisitSchedule.objects
+            .select_related('school', 'created_by')
+            .prefetch_related('assigned_personnel')
+            .all()
+        )
+        return Response(VisitScheduleSerializer(qs, many=True).data)
+
+    # POST — create a new schedule
+    serializer = VisitScheduleSerializer(data=request.data)
+    if not serializer.is_valid():
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    # Conflict detection: same date, overlapping time, same personnel
+    assigned_ids = request.data.get('assigned_personnel', [])
+    if assigned_ids:
+        sched_date  = request.data.get('date')
+        start_t     = request.data.get('start_time')
+        end_t       = request.data.get('end_time')
+        conflicts   = (
+            VisitSchedule.objects
+            .filter(
+                date=sched_date,
+                status='Upcoming',
+                assigned_personnel__id__in=assigned_ids,
+                start_time__lt=end_t,
+                end_time__gt=start_t,
+            )
+            .distinct()
+        )
+        if conflicts.exists():
+            conflict_msgs = []
+            for c in conflicts:
+                for p in c.assigned_personnel.filter(id__in=assigned_ids):
+                    full = f"{p.first_name} {p.last_name}".strip() or p.username
+                    conflict_msgs.append(
+                        f"{full} is already scheduled at {c.school.school_name} "
+                        f"({c.start_time.strftime('%H:%M')}–{c.end_time.strftime('%H:%M')})"
+                    )
+            return Response(
+                {'error': 'Scheduling conflict detected.', 'conflicts': conflict_msgs},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+    schedule = serializer.save(created_by=request.user)
+    create_audit_log(
+        user=request.user,
+        action='SCHEDULE_CREATED',
+        resource='School Intelligence',
+        details=f"Visit schedule for '{schedule.school.school_name}' on {schedule.date} created.",
+        ip_address=get_client_ip(request),
+    )
+    out = VisitScheduleSerializer(
+        VisitSchedule.objects.select_related('school', 'created_by')
+        .prefetch_related('assigned_personnel').get(pk=schedule.pk)
+    )
+    return Response(out.data, status=status.HTTP_201_CREATED)
+
+
+@api_view(['GET', 'PUT', 'DELETE'])
+@permission_classes([IsAdminOrStaff])
+def trailblazing_schedule_detail_api(request, schedule_id):
+    try:
+        schedule = (
+            VisitSchedule.objects
+            .select_related('school', 'created_by')
+            .prefetch_related('assigned_personnel')
+            .get(id=schedule_id)
+        )
+    except VisitSchedule.DoesNotExist:
+        return Response({'error': 'Schedule not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+    if request.method == 'GET':
+        return Response(VisitScheduleSerializer(schedule).data)
+
+    if request.method == 'PUT':
+        prev_status = schedule.status
+        serializer  = VisitScheduleSerializer(schedule, data=request.data, partial=True)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        updated = serializer.save()
+
+        # Auto-update school.last_visited when a visit is marked Completed
+        if prev_status != 'Completed' and updated.status == 'Completed':
+            school = updated.school
+            if not school.last_visited or school.last_visited < updated.date:
+                school.last_visited = updated.date
+                school.save(update_fields=['last_visited'])
+
+        create_audit_log(
+            user=request.user,
+            action='SCHEDULE_UPDATED',
+            resource='School Intelligence',
+            details=f"Schedule {schedule.id} for '{schedule.school.school_name}' updated to '{updated.status}'.",
+            ip_address=get_client_ip(request),
+        )
+        refreshed = (
+            VisitSchedule.objects
+            .select_related('school', 'created_by')
+            .prefetch_related('assigned_personnel')
+            .get(pk=updated.pk)
+        )
+        return Response(VisitScheduleSerializer(refreshed).data)
+
+    # DELETE
+    school_name = schedule.school.school_name
+    schedule.delete()
+    create_audit_log(
+        user=request.user,
+        action='SCHEDULE_DELETED',
+        resource='School Intelligence',
+        details=f"Schedule for '{school_name}' (id={schedule_id}) deleted.",
+        ip_address=get_client_ip(request),
+    )
+    return Response({'message': 'Schedule deleted.'}, status=status.HTTP_200_OK)
+
+
+# ---------------------------------------------------------------------------
+# DASHBOARD SUMMARY  (All authenticated users)
+# ---------------------------------------------------------------------------
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def dashboard_api(request):
+    from datetime import date, datetime
+
+    today = date.today()
+
+    total_requests = MarketingRequest.objects.count()
+    pending_requests = MarketingRequest.objects.filter(status='Pending').count()
+    schools_visited = School.objects.filter(is_archived=False, last_visited__isnull=False).count()
+    documents_uploaded = Document.objects.count()
+
+    # Last 6 months for the chart
+    months = []
+    for i in range(5, -1, -1):
+        offset = today.month - i - 1
+        month_num = offset % 12 + 1
+        year = today.year + offset // 12
+        months.append(date(year, month_num, 1))
+
+    visits_raw = School.objects.filter(last_visited__isnull=False).values_list('last_visited', flat=True)
+    visits_map = {}
+    for d in visits_raw:
+        key = f"{d.year}-{d.month:02d}"
+        visits_map[key] = visits_map.get(key, 0) + 1
+
+    chart_data = [
+        {'name': m.strftime('%b'), 'visits': visits_map.get(f"{m.year}-{m.month:02d}", 0)}
+        for m in months
+    ]
+
+    # Recent marketing requests (last 5)
+    recent_requests = []
+    for r in MarketingRequest.objects.select_related('requester').order_by('-created_at')[:5]:
+        full_name = f"{r.requester.first_name} {r.requester.last_name}".strip() or r.requester.username
+        recent_requests.append({
+            'id': r.id,
+            'type': r.type,
+            'requester': full_name,
+            'status': r.status,
+            'date': r.created_at.strftime('%b %d, %Y'),
+        })
+
+    # Recent activity feed
+    activity = []
+
+    for mr in MarketingRequest.objects.select_related('requester').order_by('-created_at')[:3]:
+        full_name = f"{mr.requester.first_name} {mr.requester.last_name}".strip() or mr.requester.username
+        activity.append({
+            'type': 'request',
+            'title': 'New Marketing Request',
+            'desc': f"{mr.type} by {full_name}",
+            'time': mr.created_at.isoformat(),
+        })
+
+    for school in School.objects.filter(last_visited__isnull=False).order_by('-last_visited')[:2]:
+        activity.append({
+            'type': 'school',
+            'title': 'School Visit Completed',
+            'desc': school.school_name,
+            'time': school.last_visited.isoformat(),
+        })
+
+    for doc in Document.objects.order_by('-updated_at')[:2]:
+        activity.append({
+            'type': 'doc',
+            'title': f"Document {doc.status}",
+            'desc': doc.title,
+            'time': doc.updated_at.isoformat(),
+        })
+
+    for user in User.objects.order_by('-date_joined')[:1]:
+        full_name = f"{user.first_name} {user.last_name}".strip() or user.username
+        activity.append({
+            'type': 'user',
+            'title': 'New User Registered',
+            'desc': f"{user.role} - {full_name}",
+            'time': user.date_joined.isoformat(),
+        })
+
+    activity.sort(key=lambda x: x.get('time', '')[:10], reverse=True)
+
+    return Response({
+        'stats': {
+            'total_requests': total_requests,
+            'pending_requests': pending_requests,
+            'schools_visited': schools_visited,
+            'documents_uploaded': documents_uploaded,
+        },
+        'chart_data': chart_data,
+        'recent_requests': recent_requests,
+        'recent_activity': activity[:5],
+    })
+
+
+# ---------------------------------------------------------------------------
+# DASHBOARD — MARKETING  (server-side filtered)
+# ---------------------------------------------------------------------------
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def dashboard_marketing_api(request):
+    status_param = request.query_params.get('status', 'ALL STATUSES')
+    start_date   = request.query_params.get('startDate', '')
+    end_date     = request.query_params.get('endDate', '')
+
+    qs = MarketingRequest.objects.select_related('requester')
+
+    valid_statuses = {'Approved', 'Pending', 'Rejected', 'Cancelled'}
+
+    if status_param and status_param != 'ALL STATUSES':
+        statuses = [s.strip() for s in status_param.split(',') if s.strip() in valid_statuses]
+        if statuses:
+            qs = qs.filter(status__in=statuses)
+
+    if start_date:
+        qs = qs.filter(created_at__date__gte=start_date)
+    if end_date:
+        qs = qs.filter(created_at__date__lte=end_date)
+
+    breakdown = {'Approved': 0, 'Pending': 0, 'Rejected': 0, 'Cancelled': 0}
+    for item in qs.values('status').annotate(count=Count('id')):
+        if item['status'] in breakdown:
+            breakdown[item['status']] = item['count']
+
+    requests = []
+    for r in qs.order_by('-created_at')[:10]:
+        full_name = f"{r.requester.first_name} {r.requester.last_name}".strip() or r.requester.username
+        requests.append({
+            'id':          r.id,
+            'requestType': r.type,
+            'submittedBy': full_name,
+            'status':      r.status,
+            'date':        r.created_at.strftime('%Y-%m-%d'),
+        })
+
+    return Response({'success': True, 'breakdown': breakdown, 'requests': requests})
+
+
+# ---------------------------------------------------------------------------
+# DASHBOARD — TRAILBLAZING  (server-side filtered)
+# ---------------------------------------------------------------------------
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def dashboard_trailblazing_api(request):
+    import calendar as _cal
+
+    filter_type    = request.query_params.get('filterType', 'MONTHLY').upper()
+    start_date_str = request.query_params.get('startDate', '')
+    end_date_str   = request.query_params.get('endDate', '')
+
+    today = timezone.localdate()
+
+    def _visits_by_month(start, end):
+        qs = School.objects.filter(
+            is_archived=False,
+            last_visited__isnull=False,
+            last_visited__gte=start,
+            last_visited__lte=end,
+        ).values_list('last_visited', flat=True)
+        vm = {}
+        for d in qs:
+            key = f"{d.year}-{d.month:02d}"
+            vm[key] = vm.get(key, 0) + 1
+        return vm
+
+    if filter_type == 'YEARLY':
+        start = today.replace(month=1, day=1)
+        end   = today.replace(month=12, day=31)
+        vm = _visits_by_month(start, end)
+        chart_data = [
+            {'label': date(today.year, m, 1).strftime('%b'),
+             'visits': vm.get(f"{today.year}-{m:02d}", 0)}
+            for m in range(1, 13)
+        ]
+
+    elif filter_type == 'SEMESTRAL':
+        months_list = []
+        for i in range(5, -1, -1):
+            offset    = today.month - i - 1
+            month_num = offset % 12 + 1
+            year      = today.year + offset // 12
+            months_list.append(date(year, month_num, 1))
+        start    = months_list[0]
+        last_day = _cal.monthrange(today.year, today.month)[1]
+        end      = today.replace(day=last_day)
+        vm = _visits_by_month(start, end)
+        chart_data = [
+            {'label': m.strftime('%b'), 'visits': vm.get(f"{m.year}-{m.month:02d}", 0)}
+            for m in months_list
+        ]
+
+    elif filter_type == 'MONTHLY':
+        start    = today.replace(day=1)
+        last_day = _cal.monthrange(today.year, today.month)[1]
+        end      = today.replace(day=last_day)
+        visits_list = list(
+            School.objects.filter(
+                is_archived=False,
+                last_visited__isnull=False,
+                last_visited__gte=start,
+                last_visited__lte=end,
+            ).values_list('last_visited', flat=True)
+        )
+        chart_data = []
+        for w in range(4):
+            w_start = start + timedelta(days=w * 7)
+            w_end   = min(w_start + timedelta(days=6), end)
+            count   = sum(1 for d in visits_list if w_start <= d <= w_end)
+            chart_data.append({'label': f"Wk {w + 1}", 'visits': count})
+
+    elif filter_type == 'CUSTOM':
+        if not start_date_str or not end_date_str:
+            return Response(
+                {'success': False, 'error': 'startDate and endDate are required for CUSTOM filter.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            range_start = datetime.strptime(start_date_str, '%Y-%m-%d').date()
+            range_end   = datetime.strptime(end_date_str,   '%Y-%m-%d').date()
+        except ValueError:
+            return Response(
+                {'success': False, 'error': 'Invalid date format. Use YYYY-MM-DD.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        vm  = _visits_by_month(range_start, range_end)
+        cur = range_start.replace(day=1)
+        ordered = {}
+        while cur <= range_end:
+            key = f"{cur.year}-{cur.month:02d}"
+            ordered[key] = {'label': cur.strftime('%b %Y'), 'visits': vm.get(key, 0)}
+            next_month = cur.month + 1
+            if next_month > 12:
+                cur = cur.replace(year=cur.year + 1, month=1)
+            else:
+                cur = cur.replace(month=next_month)
+        chart_data = list(ordered.values()) or [{'label': range_start.strftime('%b %Y'), 'visits': 0}]
+
+    else:
+        return Response({'success': False, 'error': 'Invalid filterType.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    return Response({'success': True, 'chartData': chart_data})
+
+
+# ---------------------------------------------------------------------------
+# DASHBOARD — RECENT ACTIVITY  (server-side filtered)
+# ---------------------------------------------------------------------------
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def dashboard_recent_activity_api(request):
+    category = request.query_params.get('category', 'ALL ACTIVITY')
+    selected = {c.strip() for c in category.split(',') if c.strip()}
+    include_all = not selected or 'ALL ACTIVITY' in selected
+
+    activities = []
+
+    if include_all or 'Request' in selected:
+        for mr in MarketingRequest.objects.select_related('requester').order_by('-created_at')[:5]:
+            full_name = f"{mr.requester.first_name} {mr.requester.last_name}".strip() or mr.requester.username
+            activities.append({
+                'id':          mr.id,
+                'type':        'request',
+                'title':       'New Marketing Request',
+                'description': f"{mr.type} by {full_name}",
+                'timestamp':   mr.created_at.isoformat(),
+            })
+
+    if include_all or 'Visit' in selected:
+        for school in School.objects.filter(last_visited__isnull=False).order_by('-last_visited')[:5]:
+            activities.append({
+                'id':          school.id,
+                'type':        'school',
+                'title':       'School Visit Completed',
+                'description': school.school_name,
+                'timestamp':   school.last_visited.isoformat(),
+            })
+
+    if include_all or 'User' in selected:
+        for user in User.objects.order_by('-date_joined')[:5]:
+            full_name = f"{user.first_name} {user.last_name}".strip() or user.username
+            activities.append({
+                'id':          user.id,
+                'type':        'user',
+                'title':       'New User Registered',
+                'description': f"{user.role} — {full_name}",
+                'timestamp':   user.date_joined.isoformat(),
+            })
+
+    activities.sort(key=lambda x: x['timestamp'], reverse=True)
+    return Response({'success': True, 'activities': activities[:10]})
+
+
+# ---------------------------------------------------------------------------
+# DOCUMENT & REPORT MANAGEMENT  (Staff and Admin)
+# ---------------------------------------------------------------------------
+
+@api_view(['GET', 'POST'])
+@permission_classes([IsAdminOrStaff])
+def documents_api(request):
+    if request.method == 'GET':
+        qs = Document.objects.select_related('created_by').order_by('-created_at')
+        return Response(DocumentSerializer(qs, many=True).data)
+
+    data = request.data.copy()
+    data['created_by'] = request.user.id
+    serializer = DocumentSerializer(data=data)
+    if serializer.is_valid():
+        serializer.save()
+        create_audit_log(
+            user=request.user,
+            action='DOCUMENT_CREATED',
+            resource='Documents & Reports',
+            details=f"Document '{serializer.data['title']}' (id={serializer.data['id']}) created.",
+            ip_address=get_client_ip(request),
+        )
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def documents_analysis_api(request):
+    """
+    Aggregate real data to produce enrollment trends, metrics, and predictive insights.
+    Uses linear regression on historical school visit data to project future trends.
+    """
+    today = date.today()
+    current_year = today.year
+
+    schools = list(School.objects.filter(is_archived=False))
+
+    year_student_map = {}
+    year_school_count = {}
+    all_strands = {}
+
+    for school in schools:
+        if school.last_visited:
+            yr = school.last_visited.year
+            year_student_map[yr] = year_student_map.get(yr, 0) + (school.estimated_students or 0)
+            year_school_count[yr] = year_school_count.get(yr, 0) + 1
+        if school.offered_strands:
+            for strand in school.offered_strands.split(','):
+                s = strand.strip()
+                if s:
+                    all_strands[s] = all_strands.get(s, 0) + 1
+
+    mr_year_counts = {}
+    for mr in MarketingRequest.objects.all():
+        yr = mr.created_at.year
+        mr_year_counts[yr] = mr_year_counts.get(yr, 0) + 1
+
+    all_years = sorted(set(list(year_student_map.keys()) + list(mr_year_counts.keys())))
+
+    enrollment_trends = [
+        {
+            'name': str(yr),
+            'value': year_student_map.get(yr, 0),
+            'schools_visited': year_school_count.get(yr, 0),
+            'requests': mr_year_counts.get(yr, 0),
+        }
+        for yr in all_years
+    ]
+
+    total_schools = len(schools)
+    total_est_students = sum(s.estimated_students or 0 for s in schools)
+    total_requests = MarketingRequest.objects.count()
+    approved_requests = MarketingRequest.objects.filter(status='Approved').count()
+    pending_requests = MarketingRequest.objects.filter(status='Pending').count()
+    conversion_rate = round((approved_requests / total_requests * 100), 1) if total_requests > 0 else 0.0
+    total_documents = Document.objects.count()
+
+    this_year_requests = MarketingRequest.objects.filter(created_at__year=current_year).count()
+    last_year_requests = MarketingRequest.objects.filter(created_at__year=current_year - 1).count()
+    yoy_change = (
+        round(((this_year_requests - last_year_requests) / last_year_requests * 100), 1)
+        if last_year_requests > 0 else None
+    )
+
+    values = [t['value'] for t in enrollment_trends if t['value'] > 0]
+    predicted_value = None
+    predicted_growth_pct = None
+    trend_direction = 'stable'
+
+    if len(values) >= 2:
+        n = len(values)
+        x = list(range(n))
+        x_mean = sum(x) / n
+        y_mean = sum(values) / n
+        numerator = sum((x[i] - x_mean) * (values[i] - y_mean) for i in range(n))
+        denominator = sum((x[i] - x_mean) ** 2 for i in range(n))
+        if denominator != 0:
+            slope = numerator / denominator
+            intercept = y_mean - slope * x_mean
+            predicted_value = max(0, int(slope * n + intercept))
+            last_value = values[-1]
+            if last_value > 0:
+                predicted_growth_pct = round(((predicted_value - last_value) / last_value) * 100, 1)
+            trend_direction = 'upward' if slope > 0 else ('downward' if slope < 0 else 'stable')
+
+    top_strands = sorted(all_strands.items(), key=lambda x: x[1], reverse=True)[:5]
+
+    docs_by_type = {}
+    for doc in Document.objects.all():
+        docs_by_type[doc.type] = docs_by_type.get(doc.type, 0) + 1
+
+    insights = []
+
+    if trend_direction == 'upward' and predicted_growth_pct is not None:
+        insights.append(
+            f"Enrollment potential shows an upward trend — "
+            f"{predicted_growth_pct:+.1f}% growth projected for {current_year + 1}."
+        )
+    elif trend_direction == 'downward' and predicted_growth_pct is not None:
+        insights.append(
+            f"Enrollment potential is declining ({predicted_growth_pct:.1f}% projected). "
+            f"Consider intensifying outreach campaigns for {current_year + 1}."
+        )
+    else:
+        insights.append(f"Enrollment potential is stable heading into {current_year + 1}.")
+
+    if top_strands:
+        names = ', '.join(s[0] for s in top_strands[:3])
+        insights.append(f"Most offered strands in partnered schools: {names}.")
+
+    if total_requests > 0:
+        if conversion_rate >= 70:
+            insights.append(f"Strong conversion rate of {conversion_rate}% reflects effective request fulfillment.")
+        elif conversion_rate >= 50:
+            insights.append(
+                f"Moderate conversion rate of {conversion_rate}%. "
+                "Consider improving follow-through on pending requests."
+            )
+        else:
+            insights.append(
+                f"Low conversion rate of {conversion_rate}%. "
+                "Review approval workflows to improve marketing request outcomes."
+            )
+
+    if yoy_change is not None:
+        direction = "increased" if yoy_change >= 0 else "decreased"
+        insights.append(
+            f"Marketing activity {direction} by {abs(yoy_change):.1f}% compared to {current_year - 1}."
+        )
+
+    if pending_requests > 0:
+        insights.append(f"{pending_requests} request(s) currently pending review.")
+
+    return Response({
+        'enrollment_trends': enrollment_trends,
+        'metrics': {
+            'total_schools': total_schools,
+            'total_estimated_students': total_est_students,
+            'total_requests': total_requests,
+            'approved_requests': approved_requests,
+            'pending_requests': pending_requests,
+            'conversion_rate': conversion_rate,
+            'total_documents': total_documents,
+            'yoy_change': yoy_change,
+        },
+        'predictions': {
+            'next_year': str(current_year + 1),
+            'predicted_value': predicted_value,
+            'predicted_growth_pct': predicted_growth_pct,
+            'trend_direction': trend_direction,
+        },
+        'top_strands': [{'name': s[0], 'count': s[1]} for s in top_strands],
+        'documents_by_type': docs_by_type,
+        'insights': insights,
+    })
+
+
+@api_view(['GET', 'PUT', 'DELETE'])
+@permission_classes([IsAdminOrStaff])
+def document_detail_api(request, doc_id):
+    try:
+        doc = Document.objects.select_related('created_by').get(id=doc_id)
+    except Document.DoesNotExist:
+        return Response({"error": "Document not found"}, status=status.HTTP_404_NOT_FOUND)
+
+    if request.method == 'GET':
+        return Response(DocumentSerializer(doc).data)
+
+    if request.method == 'PUT':
+        serializer = DocumentSerializer(doc, data=request.data, partial=True)
+        if serializer.is_valid():
+            serializer.save()
+            create_audit_log(
+                user=request.user,
+                action='DOCUMENT_UPDATED',
+                resource='Documents & Reports',
+                details=f"Document '{doc.title}' (id={doc.id}) updated.",
+                ip_address=get_client_ip(request),
+            )
+            return Response(serializer.data)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    # DELETE — only Admin can hard-delete documents
+    if request.user.role != 'Admin':
+        return Response({"error": "Only Admins can delete documents."}, status=status.HTTP_403_FORBIDDEN)
+    doc_title, doc_id = doc.title, doc.id
+    doc.delete()
+    create_audit_log(
+        user=request.user,
+        action='DOCUMENT_DELETED',
+        resource='Documents & Reports',
+        details=f"Document '{doc_title}' (id={doc_id}) deleted.",
+        ip_address=get_client_ip(request),
+    )
+    return Response({"message": "Document deleted."}, status=status.HTTP_204_NO_CONTENT)
+
+
+# ---------------------------------------------------------------------------
+# BACKUP & RESTORE  (Admin only — ZIP archive downloaded to the client)
+#
+# ZIP layout:
+#   data.json          — serialised DB records for selected models
+#   media/<rel_path>   — every file in MEDIA_ROOT (avatars, attachments, …)
+# ---------------------------------------------------------------------------
+
+_BACKUP_MODELS = {
+    'users': lambda: list(User.objects.values(
+        'id', 'username', 'email', 'first_name', 'last_name',
+        'role', 'is_active', 'department', 'id_number', 'date_joined',
+    )),
+    'schools':            lambda: list(School.objects.values()),
+    'marketing_requests': lambda: list(MarketingRequest.objects.values()),
+    'documents':          lambda: list(Document.objects.values()),
+    'communication_logs': lambda: list(CommunicationLog.objects.values()),
+}
+
+MEDIA_ROOT = str(django_settings.MEDIA_ROOT)
+
+
+def _build_zip(selected_models):
+    """Return a BytesIO containing the complete backup ZIP."""
+    payload = {
+        'version': '1.0',
+        'app': 'CIMOre',
+        'created_at': datetime.now().isoformat(),
+        'models_included': selected_models,
+        'data': {},
+    }
+    for key in selected_models:
+        if key in _BACKUP_MODELS:
+            try:
+                payload['data'][key] = _BACKUP_MODELS[key]()
+            except Exception:
+                logger.exception('Backup export error for model=%s', key)
+                payload['data'][key] = []
+
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+        # ── database records ──
+        zf.writestr('data.json', json.dumps(payload, indent=2, default=str))
+
+        # ── media files ──
+        if os.path.isdir(MEDIA_ROOT):
+            for dirpath, _, filenames in os.walk(MEDIA_ROOT):
+                for fname in filenames:
+                    abs_path = os.path.join(dirpath, fname)
+                    # store as  media/<relative>  inside the ZIP
+                    rel = os.path.relpath(abs_path, MEDIA_ROOT)
+                    arcname = 'media/' + rel.replace(os.sep, '/')
+                    zf.write(abs_path, arcname)
+
+    buf.seek(0)
+    return buf
+
+
+@api_view(['POST'])
+@permission_classes([IsAdmin])
+def backup_api(request):
+    selected = request.data.get('models', list(_BACKUP_MODELS.keys()))
+    filename = os.path.basename(request.data.get('filename', '').strip())
+    if not filename:
+        filename = f"cimore_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    if not filename.endswith('.zip'):
+        filename = filename.removesuffix('.json') + '.zip'
+
+    buf = _build_zip(selected)
+    logger.info('Backup ZIP generated: models=%s by user_id=%s', selected, request.user.id)
+    create_audit_log(
+        user=request.user,
+        action='BACKUP_CREATED',
+        resource='Backup & Restore',
+        details=f"System backup created with models: {', '.join(selected)}.",
+        ip_address=get_client_ip(request),
+    )
+
+    response = HttpResponse(buf.read(), content_type='application/zip')
+    response['Content-Disposition'] = f'attachment; filename="{filename}"'
+    return response
+
+
+def _restore_db(payload):
+    """Import DB records from a parsed backup payload. Returns results dict."""
+    data = payload.get('data', {})
+    results = {}
+
+    def _upsert(Model, key):
+        created = 0
+        rows = data.get(key, [])
+        for obj in rows:
+            obj = dict(obj)
+            obj_id = obj.pop('id', None)
+            if obj_id is None:
+                continue
+            _, was_created = Model.objects.get_or_create(id=obj_id, defaults=obj)
+            if was_created:
+                created += 1
+        results[key] = f'{created} created, {len(rows) - created} already existed'
+
+    with transaction.atomic():
+        if 'schools' in data:
+            _upsert(School, 'schools')
+        if 'documents' in data:
+            _upsert(Document, 'documents')
+        if 'communication_logs' in data:
+            _upsert(CommunicationLog, 'communication_logs')
+        if 'marketing_requests' in data:
+            _upsert(MarketingRequest, 'marketing_requests')
+        if 'users' in data:
+            created = 0
+            rows = data['users']
+            for obj in rows:
+                username = obj.get('username', '')
+                if not User.objects.filter(username=username).exists():
+                    User.objects.create_user(
+                        username=username,
+                        email=obj.get('email', ''),
+                        first_name=obj.get('first_name', ''),
+                        last_name=obj.get('last_name', ''),
+                        role=obj.get('role', 'Staff'),
+                        department=obj.get('department', ''),
+                        id_number=obj.get('id_number', ''),
+                        is_active=obj.get('is_active', True),
+                        password=User.objects.make_random_password(),
+                        must_change_password=True,
+                    )
+                    created += 1
+            results['users'] = f'{created} created, {len(rows) - created} already existed'
+
+    return results
+
+
+@api_view(['POST'])
+@permission_classes([IsAdmin])
+def restore_api(request):
+    backup_file = request.FILES.get('backup_file')
+    if not backup_file:
+        return Response({'error': 'No backup file provided.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    fname_lower = backup_file.name.lower()
+    files_restored = 0
+
+    try:
+        if fname_lower.endswith('.zip'):
+            raw = backup_file.read()
+            if not zipfile.is_zipfile(BytesIO(raw)):
+                return Response({'error': 'File is not a valid ZIP archive.'}, status=status.HTTP_400_BAD_REQUEST)
+
+            with zipfile.ZipFile(BytesIO(raw), 'r') as zf:
+                names = zf.namelist()
+
+                # ── restore database records ──
+                if 'data.json' not in names:
+                    return Response({'error': 'ZIP is missing data.json — not a CIMOre backup.'}, status=status.HTTP_400_BAD_REQUEST)
+                payload = json.loads(zf.read('data.json').decode('utf-8'))
+
+                # ── restore media files ──
+                for name in names:
+                    if name == 'data.json' or name.endswith('/'):
+                        continue
+                    if name.startswith('media/'):
+                        rel = name[len('media/'):]
+                        dest = os.path.join(MEDIA_ROOT, rel)
+                        os.makedirs(os.path.dirname(dest), exist_ok=True)
+                        if not os.path.exists(dest):          # never overwrite existing files
+                            with zf.open(name) as src, open(dest, 'wb') as dst:
+                                dst.write(src.read())
+                            files_restored += 1
+
+        elif fname_lower.endswith('.json'):
+            # Legacy JSON-only backup (backward-compatible)
+            payload = json.loads(backup_file.read().decode('utf-8'))
+
+        else:
+            return Response(
+                {'error': 'Unsupported format. Upload a .zip (full backup) or .json (data-only backup).'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+    except (json.JSONDecodeError, KeyError):
+        return Response({'error': 'Could not parse backup file.'}, status=status.HTTP_400_BAD_REQUEST)
+    except Exception:
+        logger.exception('Restore pre-processing failed')
+        return Response({'error': 'Failed to read backup file.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    if payload.get('app') != 'CIMOre':
+        return Response({'error': 'Incompatible backup (wrong app identifier).'}, status=status.HTTP_400_BAD_REQUEST)
+
+    try:
+        results = _restore_db(payload)
+    except Exception:
+        logger.exception('Restore DB import failed')
+        return Response(
+            {'error': 'Database restore failed. No records were changed.'},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+    if files_restored:
+        results['files'] = f'{files_restored} media file(s) restored'
+
+    logger.info('Restore completed by user_id=%s: %s', request.user.id, results)
+    create_audit_log(
+        user=request.user,
+        action='RESTORE_COMPLETED',
+        resource='Backup & Restore',
+        details=f"System restore completed. Results: {results}.",
+        ip_address=get_client_ip(request),
+    )
+    return Response({'message': 'Restore completed successfully.', 'results': results})
+
+
+# ---------------------------------------------------------------------------
+# NOTIFICATIONS
+# ---------------------------------------------------------------------------
+
+def _get_prefs(user):
+    prefs, _ = NotificationPreference.objects.get_or_create(user=user)
+    return prefs
+
+
+def _notify(recipient, title, body, notif_type='system', link='', send_email=True):
+    """Create an in-app notification and optionally email the recipient."""
+    Notification.objects.create(
+        recipient=recipient, title=title, body=body, type=notif_type, link=link,
+    )
+    if send_email and recipient.email:
+        prefs = _get_prefs(recipient)
+        if prefs.email_notifications:
+            full_name = f"{recipient.first_name} {recipient.last_name}".strip() or recipient.username
+            send_notification_email(recipient.email, full_name, title, body)
+
+
+def _notify_role(roles, title, body, notif_type='system', link='', exclude_user=None):
+    """Create notifications for all active users matching any of the given roles."""
+    qs = User.objects.filter(role__in=roles, is_active=True)
+    if exclude_user:
+        qs = qs.exclude(pk=exclude_user.pk)
+    for user in qs:
+        _notify(user, title, body, notif_type=notif_type, link=link)
+
+
+def _notif_to_dict(n):
+    return {
+        'id':         n.id,
+        'title':      n.title,
+        'body':       n.body,
+        'type':       n.type,
+        'is_read':    n.is_read,
+        'created_at': n.created_at.isoformat(),
+        'link':       n.link,
+    }
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def notifications_list_api(request):
+    """Return the 30 most recent notifications + unread count for the current user."""
+    qs = Notification.objects.filter(recipient=request.user).order_by('-created_at')[:30]
+    unread = Notification.objects.filter(recipient=request.user, is_read=False).count()
+    return Response({'notifications': [_notif_to_dict(n) for n in qs], 'unread': unread})
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def notification_read_api(request, notif_id):
+    """Mark a single notification as read."""
+    try:
+        n = Notification.objects.get(id=notif_id, recipient=request.user)
+    except Notification.DoesNotExist:
+        return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
+    n.is_read = True
+    n.save(update_fields=['is_read'])
+    return Response({'ok': True})
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def notifications_read_all_api(request):
+    """Mark all of the current user's notifications as read."""
+    Notification.objects.filter(recipient=request.user, is_read=False).update(is_read=True)
+    return Response({'ok': True})
+
+
+@api_view(['GET', 'PUT'])
+@permission_classes([IsAuthenticated])
+def notification_prefs_api(request):
+    prefs = _get_prefs(request.user)
+    if request.method == 'GET':
+        return Response({
+            'email_notifications': prefs.email_notifications,
+            'push_notifications':  prefs.push_notifications,
+            'marketing_updates':   prefs.marketing_updates,
+        })
+    # PUT — update
+    for field in ('email_notifications', 'push_notifications', 'marketing_updates'):
+        if field in request.data:
+            setattr(prefs, field, bool(request.data[field]))
+    prefs.save()
+    return Response({
+        'email_notifications': prefs.email_notifications,
+        'push_notifications':  prefs.push_notifications,
+        'marketing_updates':   prefs.marketing_updates,
+    })
+
+
+@api_view(['GET', 'POST'])
+@permission_classes([IsAuthenticated])
+def announcements_api(request):
+    """
+    GET  — return all active announcements (all authenticated users).
+    POST — create a new announcement and notify the target group (Admin only).
+    """
+    if request.method == 'GET':
+        qs = Announcement.objects.filter(is_active=True).select_related('created_by')
+        return Response(AnnouncementSerializer(qs, many=True).data)
+
+    # POST — admin only
+    if request.user.role != 'Admin':
+        return Response({'error': 'Admin access required.'}, status=status.HTTP_403_FORBIDDEN)
+
+    title   = request.data.get('title', '').strip()
+    message = request.data.get('message', '').strip()
+    target  = request.data.get('target', 'All Staff')
+
+    if not title or not message:
+        return Response({'error': 'Title and message are required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    ann = Announcement.objects.create(
+        title=title, message=message, target=target, created_by=request.user,
+    )
+
+    role_map = {
+        'All Staff':         ['Admin', 'Staff'],
+        'All Collaborators': ['Collaborator'],
+    }
+    _notify_role(
+        role_map.get(target, ['Admin', 'Staff', 'Collaborator']),
+        f'Announcement: {title}',
+        message,
+        notif_type='announcement',
+        exclude_user=request.user,
+    )
+
+    logger.info('Admin user_id=%s created announcement id=%s (target=%s)', request.user.id, ann.id, target)
+    create_audit_log(
+        user=request.user,
+        action='ANNOUNCEMENT_CREATED',
+        resource='Announcements',
+        details=f"Announcement '{title}' created targeting '{target}'.",
+        ip_address=get_client_ip(request),
+    )
+    return Response(AnnouncementSerializer(ann).data, status=status.HTTP_201_CREATED)
+
+
+@api_view(['POST'])
+@permission_classes([IsAdmin])
+def notification_send_api(request):
+    """Admin: broadcast a notification (+ optional email) to a target group."""
+    title      = request.data.get('title', '').strip()
+    # accept 'message' (frontend) or 'body' (legacy) interchangeably
+    body       = (request.data.get('message') or request.data.get('body') or '').strip()
+    via_email  = bool(request.data.get('send_email', True))
+
+    if not title:
+        return Response({'error': 'Title is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    # accept roles array from frontend OR legacy target string
+    roles_input = request.data.get('roles')
+    if roles_input and isinstance(roles_input, list):
+        roles = [r for r in roles_input if r in ('Admin', 'Staff', 'Collaborator')]
+    else:
+        target   = request.data.get('target', 'all')
+        role_map = {
+            'all':           ['Admin', 'Staff', 'Collaborator'],
+            'staff_admin':   ['Admin', 'Staff'],
+            'collaborators': ['Collaborator'],
+        }
+        roles = role_map.get(target, ['Admin', 'Staff', 'Collaborator'])
+
+    recipients = User.objects.filter(role__in=roles, is_active=True)
+
+    sent = 0
+    for user in recipients:
+        _notify(user, title, body, notif_type='announcement', send_email=via_email)
+        sent += 1
+
+    logger.info('Admin user_id=%s broadcast notification to %d users (roles=%s)', request.user.id, sent, roles)
+    return Response({'message': f'Notification sent to {sent} user(s).'})
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def notification_test_email_api(request):
+    """Send a test notification email to the current user."""
+    user = request.user
+    if not user.email:
+        return Response({'error': 'Your account has no email address.'}, status=status.HTTP_400_BAD_REQUEST)
+    full_name = f"{user.first_name} {user.last_name}".strip() or user.username
+    ok = send_notification_email(
+        user.email, full_name,
+        'Test Notification from CiMORe',
+        'This is a test notification to confirm your email delivery settings are working correctly.',
+    )
+    if ok:
+        return Response({'message': f'Test email sent to {user.email}.'})
+    return Response({'error': 'Email delivery failed. Check server email settings.'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+# ---------------------------------------------------------------------------
+# AUDIT LOGS  (Admin only)
+# ---------------------------------------------------------------------------
+
+@api_view(['GET'])
+@permission_classes([IsAdmin])
+def audit_logs_api(request):
+    from math import ceil
+
+    qs = AuditLog.objects.all()
+
+    start_date = request.query_params.get('start_date', '').strip()
+    end_date   = request.query_params.get('end_date', '').strip()
+    search     = request.query_params.get('search', '').strip()
+    action     = request.query_params.get('action', '').strip()
+
+    if start_date:
+        qs = qs.filter(timestamp__date__gte=start_date)
+    if end_date:
+        qs = qs.filter(timestamp__date__lte=end_date)
+    if search:
+        qs = qs.filter(Q(user_name__icontains=search) | Q(email__icontains=search))
+    if action and action != 'ALL':
+        qs = qs.filter(action=action)
+
+    total = qs.count()
+
+    try:
+        page = max(1, int(request.query_params.get('page', 1)))
+    except (ValueError, TypeError):
+        page = 1
+    try:
+        page_size = int(request.query_params.get('page_size', 25))
+        if page_size not in (10, 25, 50):
+            page_size = 25
+    except (ValueError, TypeError):
+        page_size = 25
+
+    offset  = (page - 1) * page_size
+    records = qs[offset:offset + page_size]
+
+    return Response({
+        'count':       total,
+        'page':        page,
+        'page_size':   page_size,
+        'total_pages': ceil(total / page_size) if total else 1,
+        'results':     AuditLogSerializer(records, many=True).data,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Password Reset
+# ---------------------------------------------------------------------------
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def forgot_password_api(request):
+    """
+    POST { email }
+    Creates a reset token and emails a link. Always returns 200 so we don't
+    reveal whether an account exists for a given email.
+    """
+    email = (request.data.get('email') or '').strip().lower()
+    if not email:
+        return Response({'message': 'If that email exists in our system, a reset link has been sent.'})
+
+    try:
+        user = User.objects.get(email__iexact=email, is_active=True)
+    except User.DoesNotExist:
+        return Response({'message': 'If that email exists in our system, a reset link has been sent.'})
+
+    # Invalidate any existing unused tokens for this user
+    PasswordResetToken.objects.filter(user=user, used=False).update(used=True)
+
+    token_obj = PasswordResetToken(user=user)
+    token_obj.save()
+
+    full_name = f"{user.first_name} {user.last_name}".strip() or user.username
+    send_password_reset_email(user.email, full_name, token_obj.token)
+
+    return Response({'message': 'If that email exists in our system, a reset link has been sent.'})
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def reset_password_api(request):
+    """
+    POST { token, new_password }
+    Validates the reset token and sets the new password.
+    """
+    token_str    = (request.data.get('token') or '').strip()
+    new_password = (request.data.get('new_password') or '').strip()
+
+    if not token_str or not new_password:
+        return Response({'error': 'Token and new password are required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    if len(new_password) < 8:
+        return Response({'error': 'Password must be at least 8 characters.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    try:
+        token_obj = PasswordResetToken.objects.select_related('user').get(token=token_str)
+    except PasswordResetToken.DoesNotExist:
+        return Response({'error': 'Invalid or expired reset link.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    if not token_obj.is_valid():
+        return Response({'error': 'This reset link has expired or already been used.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    user = token_obj.user
+    user.set_password(new_password)
+    user.must_change_password = False
+    user.save()
+
+    token_obj.used = True
+    token_obj.save()
+
+    # Invalidate all auth tokens so old sessions are logged out
+    SecureToken.objects.filter(user=user).delete()
+
+    create_audit_log(
+        user=user,
+        action='PASSWORD_RESET',
+        resource='Authentication',
+        details=f"Password reset completed for user '{user.username}'.",
+        ip_address=get_client_ip(request),
+    )
+
+    return Response({'message': 'Password reset successful. You can now log in with your new password.'})
