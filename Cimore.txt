@@ -38,17 +38,6 @@ SUPPORT_EMAIL=cimo@slc-sflu.edu.ph
 # --- Database (Supabase / PostgreSQL) ---
 DATABASE_URL="postgresql://postgres.vlgzywzpviatgdnolrea:CiMORe@2026@aws-1-ap-southeast-2.pooler.supabase.com:6543/postgres"
 
-
-# --- Email — Gmail API ---
-# =============================================================================
-# --- Jericho Mailer
-#EMAIL_HOST_USER=jerichourbano.01.01.04@gmail.com
-#DEFAULT_FROM_EMAIL=CiMORe <jerichourbano.01.01.04@gmail.com>
-#GMAIL_API_CLIENT_ID=890324103410-8909eeosilja0gi0kk224cm44ofk7dsf.apps.googleusercontent.com
-#GMAIL_API_CLIENT_SECRET=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
-#GMAIL_API_REFRESH_TOKEN=1//04F6mUblvB8fOCgYIARAAGAQSNwF-L9IrlUvFT5IAq69v34ZPFsB0Hn088UxvRSbdVyF57grOYalkV5jhP9yKEzthv02vQ8kP_j4
-# =============================================================================
-
 # =============================================================================
 # --- AERI Mailer
 EMAIL_HOST_USER=23100351@slc-sflu.edu.ph
